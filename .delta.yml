@@ -1,0 +1,99 @@
+jobs:
+  backend-lint:
+    docker: circleci/python:3.7.0
+    steps:
+      - run: sudo pip install flake8
+        when: first_run
+      - ./bin/flake8_tests.sh
+  frontend-lint:
+    env:
+      CYPRESS_INSTALL_BINARY: 0
+      PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: 1
+    docker: circleci/node:12
+    steps:
+      - run: mkdir -p /tmp/test-results/eslint
+        when: first_run
+      - run: npm ci
+        when:
+          changed: "**/package*.json"
+      - npm run lint:ci
+  frontend-unit-tests:
+    env:
+      CYPRESS_INSTALL_BINARY: 0
+      PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: 1
+    docker: circleci/node:12
+    steps:
+      - name: Install python3-pip
+        run: sudo apt update && sudo apt install python3-pip
+        when: first_run
+      - sudo pip3 install -r requirements_bundles.txt
+      - run: npm ci
+        when:
+          changed: "**/package*.json"
+      - name: frontend-lint
+        run: npm run lint:ci
+        report_status: true
+      - npm run bundle
+      - run: npm test
+        name: Run App Tests
+      - name: Run Visualizations Tests
+        run: cd viz-lib && npm test
+      - run: npm run lint
+  backend-unit-tests:
+    machine:
+      vcpu: 8
+      mem_mb: 16000
+    env:
+      COMPOSE_FILE: .circleci/docker-compose.circle.yml
+      COMPOSE_PROJECT_NAME: redash
+    docker: circleci/buildpack-deps:xenial
+    steps:
+      - name: Build Docker Images
+        run: |
+          set -x
+          docker-compose build --build-arg skip_ds_deps=true --build-arg skip_frontend_build=true
+          docker-compose up -d
+          sleep 10
+      - name: Create Test Database
+        run: docker-compose run --rm postgres psql -h postgres -U postgres -c "create database tests;"
+      - name: List Enabled Query Runners
+        run: docker-compose run --rm redash manage ds list_types
+      - name: Run Tests
+        run: docker-compose run --name tests redash tests --junitxml=junit.xml --cov-report xml --cov=redash --cov-config .coveragerc tests/
+        when: always
+      - name: Copy Test Results
+        run: |
+          mkdir -p /tmp/test-results/unit-tests
+          docker cp tests:/app/coverage.xml ./coverage.xml
+          docker cp tests:/app/junit.xml /tmp/test-results/unit-tests/results.xml
+      - run: docker-compose down
+        when: always
+  frontend-e2e-tests:
+    machine:
+      vcpu: 8
+      mem_mb: 16000
+    env:
+      COMPOSE_FILE: .circleci/docker-compose.cypress.yml
+      COMPOSE_PROJECT_NAME: cypress
+      CYPRESS_INSTALL_BINARY: 0
+      PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: 1
+      PERCY_TOKEN: ddbcffd4497c339ea4dd356b9cd04c998f84f311df06b3dc96146a8a1228d170==
+      CYPRESS_PROJECT_ID: cx6nb6
+      CYPRESS_RECORD_KEY: 2c9a6746-b774-4cf1-b447-f229cdc74d2b
+    docker: circleci/node:12
+    steps:
+      - run: npm ci
+        when:
+          changed: "**/package*.json"
+      - name: Setup Redash server
+        run: |
+          npm run cypress build
+          npm run cypress start -- --skip-db-seed
+          docker-compose run cypress npm run cypress db-seed
+      - name: Execute Cypress tests
+        run: npm run cypress run-ci
+      - name: "Failure: output container logs to console"
+        run: docker-compose logs        
+        when: on_fail
+      - run: docker-compose down
+        when: always
